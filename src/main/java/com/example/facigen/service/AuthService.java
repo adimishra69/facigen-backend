@@ -10,7 +10,7 @@ import com.example.facigen.repository.PendingEmailChangeRepository;
 import com.example.facigen.repository.PendingRegistrationRepository;
 import com.example.facigen.repository.UserRepository;
 import com.example.facigen.repository.UserSessionRepository;
-import jakarta.transaction.Transactional;
+import org.springframework.transaction.annotation.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -43,6 +43,8 @@ AuthService {
         }
 
         Role role;
+        LocalDateTime now = LocalDateTime.now();
+
 
         try {
             role = Role.valueOf(request.getRole().toUpperCase());
@@ -51,6 +53,24 @@ AuthService {
                     "Invalid role. Use CUSTOMER or PROFESSIONAL"
             );
         }
+
+        PendingRegistration pendingRegistration =
+                pendingRegistrationRepository
+                        .findByEmail(request.getEmail())
+                        .orElseGet(PendingRegistration::new);
+
+        boolean existingOtpStillValid =
+                pendingRegistration.getId() != null
+                        && pendingRegistration.getOtpExpiresAt() != null
+                        && now.isBefore(pendingRegistration.getOtpExpiresAt())
+                        && pendingRegistration.getFailedAttempts() < 5;
+
+        if (existingOtpStillValid) {
+            throw new RuntimeException(
+                    "An OTP is already active. Please verify it or wait until it expires."
+            );
+        }
+
 
         String encodedPassword =
                 passwordEncoder.encode(request.getPassword());
@@ -63,19 +83,17 @@ AuthService {
                 secureRandom.nextInt(1000000)
         );
 
-        PendingRegistration pendingRegistration =
-                new PendingRegistration();
-
         pendingRegistration.setName(request.getName());
         pendingRegistration.setEmail(request.getEmail());
         pendingRegistration.setPhone(request.getPhone());
         pendingRegistration.setPassword(encodedPassword);
         pendingRegistration.setRole(role);
-        pendingRegistration.setOtp(otp);
-        LocalDateTime now = LocalDateTime.now();
+        pendingRegistration.setOtp(passwordEncoder.encode(otp));
+
+        pendingRegistration.setFailedAttempts(0);
 
         pendingRegistration.setCreatedAt(now);
-        pendingRegistration.setOtpExpiresAt(now.plusMinutes(3));
+        pendingRegistration.setOtpExpiresAt(now.plusMinutes(1));
 
         pendingRegistrationRepository.save(pendingRegistration);
 
@@ -117,10 +135,11 @@ AuthService {
         );
 
 
-        pendingRegistration.setOtp(otp);
+        pendingRegistration.setOtp(passwordEncoder.encode(otp));
+        pendingRegistration.setFailedAttempts(0);
         pendingRegistration.setCreatedAt(now);
         pendingRegistration.setOtpExpiresAt(
-                now.plusMinutes(3)
+                now.plusMinutes(1)
         );
 
         pendingRegistrationRepository.save(
@@ -137,7 +156,14 @@ AuthService {
         );
     }
 
-    @Transactional
+    public class OtpVerificationException extends RuntimeException {
+
+        public OtpVerificationException(String message) {
+            super(message);
+        }
+    }
+
+    @Transactional(noRollbackFor = OtpVerificationException.class)
     public RegisterResponse verifyRegistration(
             VerifyRegistrationRequest request
     ) {
@@ -145,21 +171,63 @@ AuthService {
         PendingRegistration pendingRegistration =
                 pendingRegistrationRepository.findByEmail(request.getEmail())
                         .orElseThrow(() ->
-                                new RuntimeException(
-                                        "Registration not found"
-                                )
+                                new RuntimeException("Registration not found")
                         );
 
-        if (LocalDateTime.now().isAfter(
-                pendingRegistration.getOtpExpiresAt())) {
+        // 1. Check OTP expiry
+        if (!LocalDateTime.now().isBefore(
+                pendingRegistration.getOtpExpiresAt()
+        )) {
 
-            throw new RuntimeException("OTP expired");
+            throw new OtpVerificationException(
+                    "OTP expired"
+            );
         }
 
-        if (!pendingRegistration.getOtp().equals(request.getOtp())) {
-            throw new RuntimeException("Invalid OTP");
+        // 2. Check maximum attempts
+        if (pendingRegistration.getFailedAttempts() >= 5) {
+
+            pendingRegistrationRepository.deleteByEmail(
+                    request.getEmail()
+            );
+
+            throw new OtpVerificationException(
+                    "Maximum OTP attempts exceeded. Please register again."
+            );
         }
 
+        // 3. Verify OTP against BCrypt hash
+        if (!passwordEncoder.matches(
+                request.getOtp(),
+                pendingRegistration.getOtp()
+        )) {
+
+            int attempts = pendingRegistration.getFailedAttempts() + 1;
+
+            // Fifth incorrect attempt
+            if (attempts >= 5) {
+
+                pendingRegistrationRepository.deleteByEmail(
+                        request.getEmail()
+                );
+
+                throw new OtpVerificationException(
+                        "Maximum OTP attempts exceeded. Please register again."
+                );
+            }
+
+            // Save failed attempt
+            pendingRegistration.setFailedAttempts(attempts);
+
+            pendingRegistrationRepository.save(pendingRegistration);
+
+            throw new OtpVerificationException(
+                    "Invalid OTP. " + (5 - attempts) +
+                            " attempts remaining."
+            );
+        }
+
+        // 4. Create actual user after successful verification
         User user = new User();
 
         user.setName(pendingRegistration.getName());
@@ -170,6 +238,7 @@ AuthService {
 
         repo.save(user);
 
+        // 5. Delete pending registration
         pendingRegistrationRepository.deleteByEmail(
                 request.getEmail()
         );
@@ -178,6 +247,7 @@ AuthService {
                 "Registration successful"
         );
     }
+
 
     @Transactional
     public LoginResponse login(LoginRequest request) {
@@ -446,6 +516,7 @@ AuthService {
                     null
             );
         }
+
     public RegisterResponse logout(
             String accessToken,
             String refreshToken
@@ -524,4 +595,9 @@ AuthService {
                 jwtToken
         );
     }
+
+
+
+
 }
+

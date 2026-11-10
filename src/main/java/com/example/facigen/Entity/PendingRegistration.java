@@ -35,8 +35,11 @@ public class PendingRegistration {
     @Column(nullable = false)
     private Role role;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 255)
     private String otp;
+
+    @Column(nullable = false)
+    private int failedAttempts = 0;
 
     @Column(nullable = false)
     private LocalDateTime createdAt;
